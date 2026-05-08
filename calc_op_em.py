@@ -58,12 +58,14 @@ def fvoigt(damp, vv):
 def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
 
     # param ray contains the necessary physical parameters to solve the RT process:
-
-    T_los = param_ray['T']
-    v_los = param_ray['v']
-    ne_los = param_ray['ne']
-    Pgas_los = param_ray['Pgas']
-    pops_los = param_ray['pops']
+    T_los = param_ray['Temperature']
+    v_los = param_ray['LOS_velocity']
+    ne_los = param_ray['Electron_density']
+    Pgas_los = param_ray['Pressure']
+    pops_l_los = param_ray['Population_lower_level']
+    pops_u_los = param_ray['Population_upper_level']
+    
+    # Wavelengths are given in nm and later will be converted to cm, to keep working in the infamous cgs 
 
     # This is a rough approximate for nH_los:
     nH_los = (Pgas_los / (const.k_B.cgs.value * T_los) - ne_los) * 0.9 # 
@@ -75,7 +77,8 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
         v_los = interp1d(np.arange(len(v_los)), v_los, kind='cubic')(np.linspace(0,len(v_los)-1,len(v_los)*refine))
         ne_los = interp1d(np.arange(len(ne_los)), ne_los, kind='cubic')(np.linspace(0,len(ne_los)-1,len(ne_los)*refine))
         nH_los = interp1d(np.arange(len(nH_los)), nH_los, kind='cubic')(np.linspace(0,len(nH_los)-1,len(nH_los)*refine))
-        pops = interp1d(np.arange(pops.shape[1]), pops, kind='cubic', axis=1)(np.linspace(0,pops.shape[1]-1,pops.shape[1]*refine))
+        pops_l_los = interp1d(np.arange(pops_l_los.shape[1]), pops_l_los, kind='cubic', axis=1)(np.linspace(0,pops_l_los.shape[1]-1,pops_l_los.shape[1]*refine))
+        pops_u_los = interp1d(np.arange(pops_u_los.shape[1]), pops_u_los, kind='cubic', axis=1)(np.linspace(0,pops_u_los.shape[1]-1,pops_u_los.shape[1]*refine))
 
     op = np.zeros((len(wavelengths), len(T_los)))
     em = np.zeros((len(wavelengths), len(T_los)))
@@ -128,10 +131,10 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     phi = fvoigt(a[None,:], vv)
 
     # Finally calculate op and em, without the loop:
-    op = (const.h.cgs.value * nu0 / (4 * np.pi)) * (pops[0][None,:] * B_lu - pops[4][None,:] * B_ul) * phi / dnu_D
+    op = (const.h.cgs.value * nu0 / (4 * np.pi)) * (pops_l_los[None,:] * B_lu - pops_u_los[None,:] * B_ul) * phi / dnu_D
     #em = op * planck(393.36E-7, T_los)[None,:]
     
-    em = (const.h.cgs.value * nu0 / (4 * np.pi)) * pops[4][None,:] * A_ul * phi / dnu_D
+    em = (const.h.cgs.value * nu0 / (4 * np.pi)) * pops_u_los[None,:] * A_ul * phi / dnu_D
 
     # If we want to take the given source function from the population file, we can do that here:
     if (take_given_S):
