@@ -153,6 +153,9 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     
     op += opc[None,:]
     em += emc[None,:]
+    
+    op[T_los<1.0] = 1E-20
+    em[T_los<1.0] = 0.0
         
     return op, em
 
