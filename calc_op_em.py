@@ -65,6 +65,16 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     pops_l_los = param_ray['Population_lower_level']
     pops_u_los = param_ray['Population_upper_level']
     
+    # Make a mask to only take into account the range where T_los is nonzero
+    
+    mask = T_los > 1.0
+    T_los = T_los[mask]
+    v_los = v_los[mask]
+    ne_los = ne_los[mask]
+    Pgas_los = Pgas_los[mask]
+    pops_l_los = pops_l_los[mask]
+    pops_u_los = pops_u_los[mask]
+    
     # Wavelengths are given in nm and later will be converted to cm, to keep working in the infamous cgs 
 
     # This is a rough approximate for nH_los:
@@ -154,8 +164,8 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     op += opc[None,:]
     em += emc[None,:]
     
-    op[T_los<1.0] = 1E-20
-    em[T_los<1.0] = 0.0
+    #op[T_los<1.0] = 1E-20
+    #em[T_los<1.0] = 0.0
         
     return op, em
 
