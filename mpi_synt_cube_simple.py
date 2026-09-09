@@ -1,6 +1,6 @@
 # This routine follow the mpi routine we did for 1.5 lw synthesis 
 # It takes a atmospheric cube that is already prepared and then splits it pixel by pixel and sytnhesizes the spectrum for each pixel.
-# But, the pixels are horizontal tis time, they are not vertical as in the previous routine. 
+# But, the pixels are horizontal this time, they are not vertical as in the previous routine. 
 
 from threadpoolctl import threadpool_limits
 
@@ -39,34 +39,39 @@ def airtovac(lambda_air):
     n = 1.0 + 0.00008336624212083 + 0.02408926869968 / (130.1065924522 - s*s) + 0.0001599740894897 / (38.92568793293 - s*s);
     return lambda_air * n
 
-def synth(param_ray, boundary, wavelengths):
-    
+def synth(param_ray, wavelengths, ds, boundary=0, s1d=None, dz_cal=0.0, use_source_function=False):
+
     # This function synthesises the spectrum for a given atmospheric column.
-    #print('\n AAAAAAAAAAA \n',param_ray['Temperature'].shape)
-    #exit();
-    
-    op, em = coe.calc_op_em(param_ray, wavelengths, take_given_S=False)
-    spectrum_temp, tau, CR = coe.simple_formal_solution(op, op, 24.0e5)
-    spectrum = 1.0 - np.exp(-tau)
-    return spectrum
+    # ds is the geometric step along the ray [cm] (should equal delta_s * 1e5).
+
+    op, em = coe.calc_op_em(param_ray, wavelengths, s1d=s1d, dz_cal=dz_cal)
+
+    if use_source_function and s1d is not None:
+        # Real formal solution with the 1D PRD source function S(lambda, z):
+        I, tau, CR = coe.simple_formal_solution(op, em, ds)
+        return I
+    else:
+        # Legacy behaviour: constant source function (S = 1), so I = 1 - exp(-tau).
+        spectrum_temp, tau, CR = coe.simple_formal_solution(op, op, ds)
+        return 1.0 - np.exp(-tau)
 
 # But now we need a function that will create a ray from a given y,z slice, taking into account sphericity:
 
-def create_curved_grid(z_index):
-    
+def create_curved_grid(z_index, delta_s=24.0, delta_z=20.0, R_sun=696.0E3):
+
     # Meant for testing, but we can also just call it from create ray and then interpolate the slice to get the parameters at each point.
+    # delta_s : sampling step along the LOS ray [km]
+    # delta_z : vertical grid spacing of the cube [km]
+    # R_sun   : solar radius [km]
     N_steps = 10001
-    
-    delta_los = 24.0
-    delta_z = 20.0  
-    
-    s = (np.arange(N_steps) - N_steps // 2) * delta_los # km    
-    R_at_the_tangent = 696.0E3 + z_index * delta_z # km
-    
+
+    s = (np.arange(N_steps) - N_steps // 2) * delta_s # km
+    R_at_the_tangent = R_sun + z_index * delta_z # km
+
     angle = np.arctan(s / R_at_the_tangent)
     y = R_at_the_tangent * angle
     z = z_index * delta_z + np.sqrt(s**2 + R_at_the_tangent**2) - R_at_the_tangent
-    
+
     return s, y, z
 
 def create_ray(slice, z_index):
@@ -88,7 +93,7 @@ def create_ray(slice, z_index):
     y_slice = (np.arange(NY) - NY // 2) * delta_los
     z_slice = (np.arange(NZ)) * delta_z
     
-    # Let's use scipy's regular grid interpolatetor for this
+    # Let's use scipy's regular grid interpolator for this
     
     interpolator = rgi((y_slice, z_slice), slice['Temperature'], bounds_error=False, fill_value=0.0)
     T_interpolated = interpolator((y, z))
@@ -109,9 +114,10 @@ def create_ray(slice, z_index):
         'Electron_density': Ne_interpolated,
         'LOS_velocity': V_interpolated,
         'Population_lower_level': PopL_interpolated/1E6, # We will choose to convert to cgs here
-        'Population_upper_level': PopU_interpolated/1E6
+        'Population_upper_level': PopU_interpolated/1E6,
+        'Height': z # geometric height above the surface along the curved ray [km], for S(lambda,z)
     }
-    
+
     return param_ray
 
 class tags(IntEnum):
@@ -126,15 +132,12 @@ def slice_tasks(cube, task_start, grain_size):
     
     task_end = min(task_start + grain_size, cube['Temperature'].shape[0])
 
-    #print (task_end)
     
     sl = slice(task_start, task_end) # this is a slice object, allowing us to access the specific thingy
     
-    #print (sl)
     data = {}
     data['taskGrainSize'] = task_end - task_start
 
-    #print (data['z']/1E3)
     data['Temperature'] = cube['Temperature'][sl,:,:]
     data['Pressure'] =          cube['Pressure'][sl,:,:]
     data['Electron_density'] = cube['Electron_density'][sl,:,:]
@@ -156,6 +159,7 @@ def overseer_work(cube, wave, task_grain_size=16, end=None, task_info=None):
     num_workers = size - 1
     closed_workers = 0
 
+    # TODO: Figure out these comments so one can know what it all means
     data_size = 0 # Let's figure out what this is - total number of pixels?
     num_tasks = 0 # And this is data_size // 16? 
     file_idx_for_task = [] # does this have sth to do with reading from file?
@@ -236,11 +240,11 @@ def overseer_work(cube, wave, task_grain_size=16, end=None, task_info=None):
         path, filename, number = task_info
         to_output.writeto(path[:-3]+filename+'_'+str(number)+'.fits', overwrite=True)    
     else:
-        to_output.writeto('/dat/milic/offlimb_output.fits', overwrite=True)
+        to_output.writeto('/dat/milic/offlimb_output_new_sliced.fits', overwrite=True)
 
     return 0  
 
-def worker_work(rank):
+def worker_work(rank, s1d=None, dz_cal=0.0):
     # Function to define the work that the workers will do
 
     while True:
@@ -283,8 +287,9 @@ def worker_work(rank):
                     
                     # Use the functions to create the ray and then synthesize the spectrum for this ray
                     param_ray = create_ray(param_slice, j)
-                
-                    I[i,j,:] = synth(param_ray, boundary=0, wavelengths=wave)
+
+                    # ds = delta_s (24 km) * 1e5 -> cm; keep in sync with create_curved_grid's delta_s
+                    I[i,j,:] = synth(param_ray, wavelengths=wave, ds=24.0e5, boundary=0, s1d=s1d, dz_cal=dz_cal, use_source_function=True)
             
             success = 1
             
@@ -319,26 +324,35 @@ if (__name__ == '__main__'):
         path = sys.argv[1] # path where the data is
         end = int(sys.argv[2])
         filename = sys.argv[3]
+        dz_cal = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0  # MURaM z=0 vs FALC z=0 offset [km]
         number = 0
-        
-        #filename = sys.argv[2]  # characteristic naming for the files, used differently depending on what 
-                                # kind of simulation we are working with 
-        #number = int(sys.argv[3]) # number of the snapshot - again will be used differently for muram, co5bold, etc...
-        #stokes = sys.argv[4].lower() == 'true' # whether to synthesize Stokes I or all 4 components
-        #atmos_format = sys.argv[5]
-        
-        cube = 0
-        
+
+        #stokes = sys.argv[5].lower() == 'true' # whether to synthesize Stokes I or all 4 components
+
         cube = h5py.File(path,'r')
 
         wave = np.linspace(392.8,394.8,1001)
-        
-        
-        print("info::overseer::input cube shape is: ", cube['Temperature'].shape)
 
+        # Build the 1D PRD source-function table once, here on the overseer, and broadcast below.
+        # (Only rank 0 opens the file on disk.)
+        opem_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "disk_center_test_opem.fits")
+        s1d = coe.load_s1d_table(opem_path, wave)
+
+        print("info::overseer::input cube shape is: ", cube['Temperature'].shape)
+        print("info::overseer::loaded 1D source function table, S shape =", s1d['S'].shape,
+              ", dz_cal =", dz_cal, "km")
+    else:
+        s1d = None
+        dz_cal = None
+
+    # Collective broadcast of the source-function table and calibration offset to every worker.
+    s1d = comm.bcast(s1d, root=0)
+    dz_cal = comm.bcast(dz_cal, root=0)
+
+    if rank == 0:
         overseer_work(cube, wave, task_grain_size = 1, end=end, task_info = [path, filename, number])
     else:
-        worker_work(rank)
+        worker_work(rank, s1d, dz_cal)
         pass
 
     

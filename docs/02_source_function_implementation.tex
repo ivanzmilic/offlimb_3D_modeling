@@ -1,0 +1,116 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=1.5cm]{geometry}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{RGB}{20,80,140}
+\titleformat{\section}{\normalfont\bfseries\color{accent}\large}{}{0em}{}
+\titlespacing{\section}{0pt}{5pt}{2pt}
+\setlist[itemize]{leftmargin=1.2em,itemsep=1pt,topsep=1pt,parsep=0pt}
+\pagestyle{empty}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Implementing a 1D PRD source function}\\[2pt]
+  {\large\color{accent} Full wavelength- and height-dependent $S(\lambda,z)$ applied to 3D opacity}\\[2pt]
+  {\small Implementation plan \textperiodcentered\ 2026-09-08}
+\end{center}
+
+\section{Idea}
+For a scattering resonance line, \emph{opacity is local} (keep computing it from
+the real 3D $T$, $v$, populations) but the \emph{source function is non-local};
+borrow the full PRD $S(\lambda,z)$ from the 1D NLTE model and integrate the
+\emph{real} formal solution:
+\[
+  I_\lambda=\sum_i\bigl(1-e^{-\Delta\tau_{\lambda,i}}\bigr)e^{-\tau_{\lambda,<i}}\,
+  S(\lambda',h_i'),\qquad
+  \eta_i(\lambda)=\chi_i(\lambda)\,S(\lambda',h_i').
+\]
+A \textbf{single} source function is used --- \emph{no line/continuum split}. Off
+limb the continuum contributes a negligible pedestal, and near line core
+$\chi_{\rm line}\!\gg\!\chi_{\rm cont}$, so the total $S=\eta/\chi$ from the file is
+already the line value there; applying it to the total 3D opacity is accurate
+across the window and removes the continuum-isolation step entirely.
+
+The curved ray already yields the geometric height $h_i$ of every sample point,
+and the tangent height sets the minimum, so $S$ is sampled over $h\ge
+h_{\rm tangent}$ --- precisely the off-limb regime. The lookup coordinates are
+velocity- and calibration-shifted: $\lambda'=\lambda-\Delta\lambda_D(v_i)$,
+$h_i'=h_i-\Delta z_{\rm cal}$ (\S4--5).
+
+\section{Build the PRD table --- once, on rank 0}
+\begin{itemize}
+  \item Load \code{disk\_center\_test\_opem.fits} $\Rightarrow$ $\chi(z,\lambda)$,
+    $\eta(z,\lambda)$, $z_{\rm 1D}$ (82 pts), $\lambda_{\rm 1D}$ (1001).
+    Interpolate in $\lambda$ onto the synthesis grid \code{wave} so the two grids
+    are guaranteed aligned.
+  \item Form the total source function directly:
+    $S(\lambda,z)=\eta(\lambda,z)/\chi(\lambda,z)$ --- no subtraction, no guard
+    ($\chi$ never vanishes thanks to the continuum floor).
+  \item Result: a compact table \code{\{lam\_1d, z\_1d, S[N$\lambda$,Nz]\}}
+    ($\sim$0.66\,MB).
+\end{itemize}
+
+\section{Distribute to workers via MPI broadcast \small(adjustment 1)}
+Only rank 0 reads the file. Before the manager/worker loop, all ranks call once
+\[
+  \code{s1d = comm.bcast(s1d, root=0)}
+\]
+(rank 0 passes the table, others pass \code{None}); each worker holds it for the
+whole run. This costs one transfer per worker ($\sim$0.66\,MB, negligible) and
+\textbf{no worker opens the file on disk}. It is independent of the existing
+tag-based \code{send}/\code{recv} task machinery.
+
+\section{Apply $S(\lambda,z)$ in the LOS integration \small(adjustment 2)}
+\begin{itemize}
+  \item \code{create\_ray}: also carry the height --- add \code{'Height': z} (km)
+    to \code{param\_ray} (already computed, currently discarded).
+  \item \code{calc\_op\_em}: compute the total opacity $\chi(\lambda,z)$ as now
+    (line from pops $+$ LTE continuum). Build the lookup coordinates per sample
+    point, $\lambda'_j=\lambda_j-\Delta\lambda_D(v_i)$ (same
+    $\Delta\lambda_D=(v_i/c)\lambda_0$ already used for the profile $\varphi$) and
+    $h'_i=h_i-\Delta z_{\rm cal}$; evaluate
+    \code{RegularGridInterpolator((lam\_1d, z\_1d), S)} at all $(\lambda'_j,h'_i)$
+    $\Rightarrow$ \code{S\_ray[N$\lambda$,Ns]}. Then set
+    $\eta=\chi\cdot\code{S\_ray}$ (the population-based emissivity is no longer
+    used for $S$). Return $\chi,\eta$.
+  \item \code{synth}: call \code{simple\_formal\_solution(op, em, ds)} and
+    \textbf{return the real $I$} instead of $1-e^{-\tau}$; keep the old behaviour
+    behind a flag for side-by-side comparison.
+  \item \code{worker\_work(rank, s1d)} / \code{synth(\dots, s1d)}: thread the
+    broadcast table through. MPI overseer/worker structure is otherwise unchanged.
+\end{itemize}
+
+\section{Height calibration --- free parameter \small(adjustment 3)}
+$\Delta z_{\rm cal}$ is a single scalar aligning MURaM's $z=0$ ($\tau_{500}{=}1$)
+with FALC's $z=0$, with convention $z_{\rm 1D}^{\rm lookup}=h_{\rm ray}-\Delta
+z_{\rm cal}$. Exposed as a top-level CLI argument (\code{sys.argv}), default $0$,
+and applied \emph{at lookup time in the worker} --- so the broadcast table stays
+offset-agnostic and one run can sweep $\Delta z_{\rm cal}$ without rebuilding it.
+Calibrate by matching the disk-centre profile or the limb-intensity inflection.
+
+\section{Caveats}
+\begin{itemize}
+  \item FALC tops out at \textbf{2.34\,Mm}; set \code{bounds\_error=False} and fill
+    above the top with $S$ at the top (or 0). Tall spicules reach higher --- an
+    extended/semi-empirical 1D model may be needed for the high LOS.
+  \item The velocity shift assumes $S$ co-moves with the plasma (PRD in the atom
+    frame); it can be disabled for a rest-frame first run.
+  \item Line/continuum split is deliberately neglected here (justified off limb);
+    revisit only if a wing or on-disk comparison later needs it.
+  \item The broken \code{take\_given\_S} branch (undefined \code{otherids}) is
+    replaced by this path.
+\end{itemize}
+
+\begin{center}\small\itshape
+Scope: \code{create\_ray}, \code{calc\_op\_em}, \code{synth}, \code{worker\_work},
+and \code{\_\_main\_\_} (load + \code{bcast} + new $\Delta z_{\rm cal}$ CLI arg).
+\end{center}
+
+\end{document}

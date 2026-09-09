@@ -1,0 +1,96 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=1.4cm]{geometry}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{RGB}{20,80,140}
+\definecolor{warn}{RGB}{150,40,40}
+\titleformat{\section}{\normalfont\bfseries\color{accent}\large}{}{0em}{}
+\titlespacing{\section}{0pt}{5pt}{2pt}
+\setlist[itemize]{leftmargin=1.2em,itemsep=1pt,topsep=1pt,parsep=0pt}
+\pagestyle{empty}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries 1D PRD source function --- as built}\\[2pt]
+  {\large\color{accent} What changed, the bug it exposed, and how to run it}\\[2pt]
+  {\small Implementation record \textperiodcentered\ 2026-09-08 \textperiodcentered\ not yet committed / not yet run on the full cube}
+\end{center}
+
+\section{Code changes}
+\textbf{\code{calc\_op\_em.py}}
+\begin{itemize}
+  \item \code{load\_s1d\_table(opem\_path, wave)} --- \emph{new}. Builds the table
+    \code{\{wave[nm], z[km asc], S[N$\lambda$,Nz]\}} as $S=\eta/\chi$ directly from
+    \code{disk\_center\_test\_opem.fits} (single total source function, no
+    line/continuum split), interpolated onto the synthesis grid.
+  \item \code{calc\_op\_em(\dots, s1d=None, dz\_cal=0.0)} --- pulls \code{'Height'}
+    from the ray (masked/refined in lockstep) and, when a table is given, overrides
+    $\eta=\chi\cdot S(\lambda',z')$ via \code{RegularGridInterpolator}. Lookup is
+    velocity-shifted $\lambda'=\lambda-(v/c)\lambda_0$ (same shift as the Voigt
+    profile) and calibration-shifted $z'=h-\Delta z_{\rm cal}$, clamped to the
+    table range (nearest-edge above the FALC top, 2342\,km).
+\end{itemize}
+\textbf{\code{mpi\_synt\_cube\_simple.py}}
+\begin{itemize}
+  \item \code{create\_ray} now carries \code{'Height': z} (the curved-ray
+    geometric height, already computed).
+  \item \code{synth(\dots, s1d, dz\_cal, use\_source\_function=True)} --- real
+    formal solution with the 1D $S$; legacy $1-e^{-\tau}$ kept behind the flag
+    (\code{s1d=None}).
+  \item \code{worker\_work(rank, s1d, dz\_cal)} threads the table through.
+  \item \code{\_\_main\_\_} loads the table \textbf{once on rank 0},
+    \code{comm.bcast}s it to all workers (no worker opens the file), and reads
+    $\Delta z_{\rm cal}$ as an optional \textbf{4th CLI argument} (km, default 0).
+\end{itemize}
+
+\section{\textcolor{warn}{Latent bug found \& fixed:} \code{simple\_formal\_solution}}
+Turning on the source function exposed an error in the formal solver: it formed
+$(1-e^{-\tau_{\rm cumulative}})\,S$ and multiplied by the cumulative transmission
+\emph{again} --- wrong for optically-thick cells, yielding $I>\max(S)$, which is
+impossible with no incident radiation. It never mattered before because the old
+\code{synth} \emph{discarded} this output and returned $1-e^{-\tau}$. Replaced with
+the correct, \code{expm1}-stable
+\[
+  I_\lambda=\sum_i S_i\,\bigl(1-e^{-\Delta\tau_i}\bigr)\,e^{-\tau_{{\rm upwind},i}},
+  \qquad \tau_{{\rm upwind},i}=\tau_i-\Delta\tau_i .
+\]
+Now bounded by $\max(S)$. The legacy $1-e^{-\tau}$ path is unaffected (same $\tau$).
+
+\section{Validation (synthetic columns)}
+\begin{itemize}
+  \item $I$ finite, $\ge0$, and \textbf{bounded by $\max(S)$} along each ray.
+  \item Core intensity \textbf{decays with tangent height}: $4.5\times10^{-9}$
+    (200\,km) $\to 1.6\times10^{-9}$ (1200\,km) $\to 1.2\times10^{-11}$ (3000\,km) ---
+    the physical off-limb falloff, versus the legacy profile saturating at $\sim$1.
+  \item The velocity/height lookup reproduces a direct table interpolation at the
+    shifted $(\lambda,h)$; $\Delta z_{\rm cal}$ shifts the result as expected.
+\end{itemize}
+
+\section{How to run}
+\begin{verbatim}
+  module load mpi/openmpi-401_gcc-485
+  mpirun -n <N> python mpi_synt_cube_simple.py <cube.h5> <end> <filename> <dz_cal_km>
+\end{verbatim}
+The 4th argument is optional; omit it for $\Delta z_{\rm cal}=0$.
+(A plain shell without the MPI module cannot even import the driver --- \code{mpi4py}
+needs \code{libmpi}.)
+
+\section{Open items}
+\begin{itemize}
+  \item \textbf{Calibrate $\Delta z_{\rm cal}$}: align MURaM's $z=0$ to FALC's by
+    matching the disk-centre profile or the limb-intensity inflection.
+  \item \textbf{Performance}: the per-ray 2D interpolation is the hot spot at scale;
+    optimise later, or drop the velocity shift for a rest-frame first run.
+  \item \textbf{Not yet run} on
+    \code{/dat/milic/SUSI\_modeling/extended\_off\_limb\_ssd\_cube\_paper\_angle\_80.h5};
+    changes are uncommitted (\code{calc\_op\_em.py}, \code{mpi\_synt\_cube\_simple.py}).
+\end{itemize}
+
+\end{document}

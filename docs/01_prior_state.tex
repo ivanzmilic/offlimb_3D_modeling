@@ -1,0 +1,85 @@
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=1.6cm]{geometry}
+\usepackage{amsmath}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage[hidelinks]{hyperref}
+
+\definecolor{accent}{RGB}{20,80,140}
+\titleformat{\section}{\normalfont\bfseries\color{accent}\large}{}{0em}{}
+\titlespacing{\section}{0pt}{6pt}{2pt}
+\setlist[itemize]{leftmargin=1.2em,itemsep=1pt,topsep=1pt,parsep=0pt}
+\pagestyle{empty}
+\newcommand{\code}[1]{\texttt{\small #1}}
+
+\begin{document}
+
+\begin{center}
+  {\LARGE\bfseries Off-limb 3D modeling of Ca\,\textsc{ii}\,K}\\[2pt]
+  {\large\color{accent} Prior state of the pipeline}\\[2pt]
+  {\small Summary \textperiodcentered\ 2026-09-08}
+\end{center}
+
+\vspace{-2pt}
+\textbf{Goal.} Produce as realistic as possible a model of the off-limb Ca\,\textsc{ii}\,K
+emission (to interpret Sunrise/SUSI data), starting from a 3D MURaM cube plus the
+Ca\,\textsc{ii} level populations of the line.
+
+\section{Pipeline (three stages)}
+\begin{enumerate}[leftmargin=1.4em,itemsep=2pt,topsep=1pt]
+  \item \textbf{Geometry preparation} --- \code{extend\_cube.ipynb}.
+    Reads a 1.5D Lightweaver synthesis of a MURaM SSD/network snapshot
+    (\code{...\_lwsynth\_392.8.fits} $\Rightarrow$ lower/upper level populations
+    \code{pops[x,y,0,z]}) and the raw MURaM snapshot ($T,P,n_e,v$).
+    Cuts a shallow-angle ($80^\circ$) line through the periodic box and
+    \emph{unrolls} it by modulo-folding into a long horizontal slab
+    ($\sim$300\,Mm, \code{n\_steps}$\approx$12500), so a single box tiles into a
+    full off-limb line of sight. Output: an HDF5 cube
+    \code{[6, Nx, N\_los, Nz]} with $T$, $P$, $n_e$, $v_{\rm LOS}$ and the two
+    level populations (upper/lower flipped in $z$ for the $\tau$ convention).
+  \item \textbf{3D solver} --- \code{mpi\_synt\_cube\_simple.py}.
+    MPI overseer/worker, one task per $x$-slice. For each $(x,z_{\rm tangent})$ it
+    builds a \emph{curved ray} (\code{create\_curved\_grid}): a straight LOS in
+    spherical geometry giving path $s$, position $y$, and geometric height $z$
+    above the surface, with tangent height $=z_{\rm index}\cdot 20$\,km. The slab
+    is interpolated onto the ray; then \code{synth} $\to$ \code{calc\_op\_em}
+    $\to$ \code{simple\_formal\_solution}.
+  \item \textbf{Physics} --- \code{calc\_op\_em.py}.
+    Ca\,\textsc{ii}\,K line opacity/emissivity from the populations (Voigt profile,
+    natural broadening only, Doppler width from $T$, shift from $v_{\rm LOS}$),
+    plus LTE continuum (\code{contop.py}) with $\eta_c=\chi_c\,B_\nu(T)$.
+\end{enumerate}
+
+\section{1D reference (for calibration)}
+\code{fs\_1d\_los.py} / \code{generate\_s\_prd.py} solve FALC in NLTE \emph{with PRD}
+(Lightweaver/Promweaver) and dump \code{disk\_center\_test\_opem.fits}:
+$\chi(z,\lambda)$ and $\eta(z,\lambda)$ on 82 heights (0--2342\,km) $\times$ 1001
+$\lambda$, on the \emph{same} wavelength grid as the 3D run (392.8--394.8\,nm).
+The line source function $S=\eta/\chi$ there falls from $\sim$$1.4\times10^{-7}$ at
+the surface to $\sim$$1\times10^{-9}$ in the chromosphere (cgs intensity units).
+
+\section{Current limitation: no real source function}
+In \code{synth()} the formal solution is bypassed:
+\[
+  \text{op},\text{em}=\texttt{calc\_op\_em}(\dots);\quad
+  \texttt{simple\_formal\_solution(op,\,\underline{op}},\,ds)\ \Rightarrow\ S\equiv1;\quad
+  \text{return } 1-e^{-\tau_\lambda}.
+\]
+The emissivity is set equal to the opacity ($S\equiv1$), and even that result is
+discarded in favour of $I_\lambda = 1-e^{-\tau_\lambda}$ --- a \emph{pure-opacity}
+profile with a flat, unit source function.
+
+\textbf{Consequences.} Morphology of optically-thin emission is acceptable
+($I\approx\tau_\lambda$), but the line is unphysical: the real Ca\,\textsc{ii}\,K
+source function drops by $\sim$2 orders of magnitude from photosphere to
+chromosphere and saturates to 1 where the line is thick. K$_1$/K$_2$/K$_3$
+structure and absolute/relative intensities cannot be reproduced.
+
+\begin{center}\small\itshape
+Next step: replace $S\equiv1$ with a height-stratified source function taken from
+the 1D NLTE model --- see \code{docs/02\_source\_function\_implementation.pdf}.
+\end{center}
+
+\end{document}

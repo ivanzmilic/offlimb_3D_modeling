@@ -52,10 +52,53 @@ def fvoigt(damp, vv):
 
     return h/1.7724538509055159 # 1/sqrt(pi)
 
-# The goal is to calculate opacity and emissivity from a 3D cube, that we have precomputed 
+# The goal is to calculate opacity and emissivity from a 3D cube, that we have precomputed
 # so opposite to before, this is just going to take an array of physical parameters and wavelength
 
-def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
+def load_s1d_table(opem_path, wave):
+    """
+    Build the 1D PRD source-function table S(lambda, z) from a precomputed
+    disk-center opacity/emissivity file. Meant to be called once (on the MPI
+    overseer) and broadcast to the workers.
+
+    A single, total source function is used (no line/continuum split): off limb
+    the continuum contributes very little (zero) near the core the line
+    dominates the opacity, so S = eta/chi from the file is already the line value.
+
+    Returns a dict with:
+      'wave' : wavelength grid [nm], aligned to the synthesis grid `wave`
+      'z'    : geometric height grid [km], ascending
+      'S'    : total source function, shape [Nwave, Nz]
+    """
+    hdu = fits.open(opem_path)
+    opem = hdu[0].data                            # (2, Nz, Nlam1d): [chi, eta]
+    z_1d = np.asarray(hdu[1].data, dtype=float)   # (Nz,) in meters
+    hdu.close()
+
+    chi = opem[0].astype(float)                   # (Nz, Nlam1d)
+    eta = opem[1].astype(float)
+    S = eta / chi                                 # total source function (Nz, Nlam1d)
+
+    # Wavelength grid the file was computed on (nm); matches the synthesis grid.
+    wave_1d = np.linspace(392.8, 394.8, chi.shape[1])
+
+    # Interpolate S onto the synthesis wavelength grid (identity when grids match):
+    if chi.shape[1] == len(wave) and np.allclose(wave_1d, wave):
+        S_on_wave = S
+    else:
+        from scipy.interpolate import interp1d
+        S_on_wave = interp1d(wave_1d, S, axis=1, bounds_error=False,
+                             fill_value="extrapolate")(wave)      # (Nz, Nwave)
+
+    # Heights in km, ascending (RegularGridInterpolator needs increasing grids):
+    z_km = z_1d / 1e3
+    order = np.argsort(z_km)
+    z_km = z_km[order]
+    S_final = S_on_wave[order, :]
+
+    return {'wave': np.asarray(wave, dtype=float), 'z': z_km, 'S': S_final}
+
+def calc_op_em(param_ray, wavelengths, refine =0, s1d=None, dz_cal=0.0):
 
     # param ray contains the necessary physical parameters to solve the RT process:
     T_los = param_ray['Temperature']
@@ -64,9 +107,10 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     Pgas_los = param_ray['Pressure']
     pops_l_los = param_ray['Population_lower_level']
     pops_u_los = param_ray['Population_upper_level']
-    
+    h_los = param_ray.get('Height', None)   # geometric height along the ray [km], for the S(lambda,z) lookup
+
     # Make a mask to only take into account the range where T_los is nonzero
-    
+
     mask = T_los > 1.0
     T_los = T_los[mask]
     v_los = v_los[mask]
@@ -74,6 +118,8 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     Pgas_los = Pgas_los[mask]
     pops_l_los = pops_l_los[mask]
     pops_u_los = pops_u_los[mask]
+    if h_los is not None:
+        h_los = h_los[mask]
     
     # Wavelengths are given in nm and later will be converted to cm, to keep working in the infamous cgs 
 
@@ -89,6 +135,8 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
         nH_los = interp1d(np.arange(len(nH_los)), nH_los, kind='cubic')(np.linspace(0,len(nH_los)-1,len(nH_los)*refine))
         pops_l_los = interp1d(np.arange(pops_l_los.shape[1]), pops_l_los, kind='cubic', axis=1)(np.linspace(0,pops_l_los.shape[1]-1,pops_l_los.shape[1]*refine))
         pops_u_los = interp1d(np.arange(pops_u_los.shape[1]), pops_u_los, kind='cubic', axis=1)(np.linspace(0,pops_u_los.shape[1]-1,pops_u_los.shape[1]*refine))
+        if h_los is not None:
+            h_los = interp1d(np.arange(len(h_los)), h_los, kind='cubic')(np.linspace(0,len(h_los)-1,len(h_los)*refine))
 
     op = np.zeros((len(wavelengths), len(T_los)))
     em = np.zeros((len(wavelengths), len(T_los)))
@@ -146,14 +194,6 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     
     em = (const.h.cgs.value * nu0 / (4 * np.pi)) * pops_u_los[None,:] * A_ul * phi / dnu_D
 
-    # If we want to take the given source function from the population file, we can do that here:
-    if (take_given_S):
-        opem = fits.open("/home/milic/codes/spherical1d/disk_center_test_opem_muram.fits")[0].data[:,otherids[1],:]
-        S = opem[1]/opem[0]
-        opemline = opem - opem[:,0][:,None]
-        Sline = opemline[1,947]/opemline[0,947]
-        em = op * Sline
-    
     # Introducing an ad-hoc calculation of the source function to get realistic spectral line.
     #Stemp = pops[4] * A_ul / pops[0] / B_lu
     #print (Stemp[::20])
@@ -163,32 +203,52 @@ def calc_op_em(param_ray, wavelengths, refine =0, take_given_S=False):
     
     op += opc[None,:]
     em += emc[None,:]
-    
+
+    # Override the emissivity with the 1D PRD source function S(lambda, z), if provided.
+    # Single total source function applied to the total opacity (no line/continuum split):
+    #   eta = chi * S(lambda', z'),  with lambda' velocity-shifted and z' calibration-shifted.
+    if s1d is not None and h_los is not None and len(h_los) > 0:
+        from scipy.interpolate import RegularGridInterpolator as rgi
+        # Rest-frame (co-moving) wavelength at each sample point [nm]; same shift as the profile:
+        dlam_nm = (v_los / const.c.cgs.value) * llambda0 * 1e7        # cm -> nm
+        lam_q = wavelengths[:, None] - dlam_nm[None, :]              # [Nlam, Ns]
+        h_q = h_los - dz_cal                                        # [Ns], km
+
+        # Clamp to the table range: nearest-edge above the FALC top / beyond the grid edges.
+        lam_q = np.clip(lam_q, s1d['wave'][0], s1d['wave'][-1])
+        h_qc = np.clip(h_q, s1d['z'][0], s1d['z'][-1])
+        # The table is S(z, lambda), so interpolate on the (z, lambda) grid:
+        S_interp = rgi((s1d['z'], s1d['wave']), s1d['S'], bounds_error=False, fill_value=None)
+        Nl = wavelengths.shape[0]
+        Ns = h_los.shape[0]
+        h_grid = np.broadcast_to(h_qc[None, :], (Nl, Ns))           # [Nlam, Ns]
+        pts = np.empty((Nl * Ns, 2))
+        pts[:, 0] = h_grid.ravel()      # z
+        pts[:, 1] = lam_q.ravel()       # lambda
+        S_ray = S_interp(pts).reshape(Nl, Ns)
+        em = op * S_ray
+
     #op[T_los<1.0] = 1E-20
     #em[T_los<1.0] = 0.0
-        
+
     return op, em
 
 def simple_formal_solution(op, em, ds):
 
-    dtau = op[:,:] * ds
-    tau = np.cumsum(dtau, axis=1)
+    # Discrete formal solution, observer at index 0, ray running along increasing index:
+    #   I = sum_i S_i * (1 - exp(-dtau_i)) * exp(-tau_upwind_i)
+    # where dtau_i is the cell's own optical depth and tau_upwind_i is the optical depth
+    # from the observer to the near edge of the cell. This is bounded by max(S), as it must be.
+    dtau = op * ds
+    tau = np.cumsum(dtau, axis=1)     # optical depth at the far edge of each cell
+    tau_upwind = tau - dtau           # optical depth from the observer to the near edge
     Sfn = em / op
-    #print (Sfn[300,::10])
-    #print(op[300])
-    #print(em[300])    
-    #exit();
-    transmission = np.exp(-tau)
-    smalltau = np.where(tau<1E-2)
-    transmission[smalltau] = 1.0 - tau[smalltau] + 0.5 * tau[smalltau]**2 - (1.0/6.0) * tau[smalltau]**3
-    
-    local_contribution = (1.0 - transmission) * Sfn
-    local_contribution[smalltau] = dtau[smalltau] * Sfn[smalltau] * (1.0 - 0.5 * dtau[smalltau] + (1.0/6.0) * dtau[smalltau]**2 - (1.0/24.0) * dtau[smalltau]**3)
-    # Now integrate over z (axis=1):
-    outgoing_contribution = local_contribution * transmission
-    contribution_function_noS = transmission * op
+
+    escape = -np.expm1(-dtau)         # 1 - exp(-dtau), stable as dtau -> 0
+    weight = escape * np.exp(-tau_upwind)   # contribution function per cell (no S)
+    outgoing_contribution = weight * Sfn
     I = np.sum(outgoing_contribution, axis=1)
-    return I, tau[:,-1], contribution_function_noS
+    return I, tau[:, -1], weight
 
 
 
