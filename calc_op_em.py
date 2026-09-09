@@ -164,7 +164,7 @@ def calc_op_em(param_ray, wavelengths, refine =0, s1d=None, dz_cal=0.0):
     # Hard-coded line parameters for now, for Ca II 3933:
     g_l = 2
     g_u = 4
-    llambda0 = 393.3663E-7 # in cm
+    llambda0 = 393.4777E-7 # in cm; vacuum Ca II K, matches the (vacuum) S(lambda,z) opem table. Was 393.3663E-7 (air), which offset op vs S by 0.1117 nm (the air-vac shift) and made the emergent core red-asymmetric.
     nu0 = const.c.cgs.value / llambda0
     A_ul = 1.47E8
     B_ul = (const.c.cgs.value**2 / (2 * const.h.cgs.value * nu0**3.0)) * A_ul
