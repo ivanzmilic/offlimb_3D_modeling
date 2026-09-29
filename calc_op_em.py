@@ -14,6 +14,35 @@ from scipy.special import wofz
 
 from contop import continuum_opacity
 
+# ---------------------------------------------------------------------------
+# Air <-> vacuum wavelength conversion (Morton 2000 coefficients), nm in / nm out.
+#
+# The whole synthesis runs in VACUUM (lightweaver's frame; llambda0 below and the
+# opem source-function grid are both vacuum). Air is only used where wavelengths
+# are typed by hand or compared to observations. These two functions are the ONE
+# place the conversion is defined -- import them (notebooks included) instead of
+# re-deriving, so the two frames can never silently drift apart again.
+#
+# NOTE the units: sigma must be in 1/micron, i.e. 1e4 / lambda[Angstrom].  A common
+# bug is to write 1e4/lambda with lambda in nm, which is 10x too large and makes the
+# shift ~10x too small (0.014 nm instead of the correct 0.111 nm at Ca II K).
+def _air_refractivity(lam_nm):
+    """(n - 1) of standard air at wavelength lam_nm; sigma in 1/micron."""
+    sigma2 = (1.0e4 / (np.asarray(lam_nm, dtype=float) * 10.0)) ** 2   # nm -> AA -> (1/micron)
+    return (0.00008336624212083
+            + 0.02408926869968 / (130.1065924522 - sigma2)
+            + 0.0001599740894897 / (38.92568793293 - sigma2))
+
+def air_to_vac(lam_air_nm):
+    """Air -> vacuum wavelength [nm]. Ca II K: 393.3663 -> 393.4777 nm."""
+    lam = np.asarray(lam_air_nm, dtype=float)
+    return lam * (1.0 + _air_refractivity(lam))
+
+def vac_to_air(lam_vac_nm):
+    """Vacuum -> air wavelength [nm]; inverse of air_to_vac to sub-pm."""
+    lam = np.asarray(lam_vac_nm, dtype=float)
+    return lam / (1.0 + _air_refractivity(lam))
+
 def planck(wave, T):
     """
     Planck function in cgs units (erg/s/cm^2/sr/Hz)
@@ -28,29 +57,13 @@ def planck(wave, T):
 
 def fvoigt(damp, vv):
     """
-    Based on:
-    Voigt function approximation using torch tensors.
-    Based on: https://github.com/aasensio/neural_fields/blob/main/utils.py#L174
+    Voigt function H(a, v) = Re[w(v + i a)] via the Faddeeva function (wofz).
+    A rational Humlicek-style approximation used to be computed here and then
+    overwritten; since only the wofz value was ever returned, it has been removed.
     """
-    A = [122.607931777104326, 214.382388694706425, 181.928533092181549,
-         93.155580458138441, 30.180142196210589, 5.912626209773153,
-         0.564189583562615]
-
-    B = [122.60793177387535, 352.730625110963558, 457.334478783897737,
-         348.703917719495792, 170.354001821091472, 53.992906912940207,
-         10.479857114260399, 1.]
-
-    z = damp - np.abs(vv) * 1j
-
-    Z = ((((((A[6] * z + A[5]) * z + A[4]) * z + A[3]) * z + A[2]) * z + A[1]) * z + A[0]) / \
-        (((((((z + B[6]) * z + B[5]) * z + B[4]) * z + B[3]) * z + B[2]) * z + B[1]) * z + B[0])
-
-    h = Z.real
-    #f = np.sign(vv) * Z.imag * 0.5
     z = vv + damp * 1j
     h = wofz(z).real
-
-    return h/1.7724538509055159 # 1/sqrt(pi)
+    return h / 1.7724538509055159  # 1/sqrt(pi)
 
 # The goal is to calculate opacity and emissivity from a 3D cube, that we have precomputed
 # so opposite to before, this is just going to take an array of physical parameters and wavelength
@@ -73,14 +86,38 @@ def load_s1d_table(opem_path, wave):
     hdu = fits.open(opem_path)
     opem = hdu[0].data                            # (2, Nz, Nlam1d): [chi, eta]
     z_1d = np.asarray(hdu[1].data, dtype=float)   # (Nz,) in meters
+    # Wavelength axis is read from the file (HDU 2), never guessed. The old
+    # hardcoded linspace(392.8, 394.8) has been removed on purpose: generate_s_prd.py
+    # now stores the actual VACUUM grid, so a grid/frame mismatch cannot be introduced
+    # silently. Regenerate old opem files (without HDU 2) with the current script.
+    if len(hdu) < 3 or hdu[2].data is None:
+        hdu.close()
+        raise ValueError(
+            "opem file %r stores no wavelength axis (expected HDU 2). Regenerate it "
+            "with the current generate_s_prd.py, which saves the vacuum grid." % opem_path)
+    wave_1d = np.asarray(hdu[2].data, dtype=float)          # (Nlam1d,) VACUUM wavelengths [nm]
+    frame = str(hdu[2].header.get('AIRORVAC', 'vac')).strip().lower()
     hdu.close()
+    if frame.startswith('air'):
+        raise ValueError(
+            "opem wavelength axis is flagged AIR, but the synthesis works in vacuum "
+            "(lightweaver's frame; llambda0 in calc_op_em is vacuum). Store the vacuum "
+            "grid instead (see generate_s_prd.py).")
 
     chi = opem[0].astype(float)                   # (Nz, Nlam1d)
     eta = opem[1].astype(float)
     S = eta / chi                                 # total source function (Nz, Nlam1d)
 
-    # Wavelength grid the file was computed on (nm); matches the synthesis grid.
-    wave_1d = np.linspace(392.8, 394.8, chi.shape[1])
+    # Alignment guard: the opem line core must sit at the vacuum Ca II K rest
+    # wavelength (== llambda0 in calc_op_em). If the axis frame or grid is wrong,
+    # fail loudly here instead of shifting S under the opacity by ~0.1-0.3 nm silently.
+    lambda0_vac = 393.4777                                  # nm; keep in sync with llambda0 in calc_op_em
+    k_core = int(np.argmax(chi.max(axis=0)))
+    if abs(wave_1d[k_core] - lambda0_vac) > 0.02:
+        raise ValueError(
+            "opem line core (max opacity) is at %.4f nm but %.4f nm (vacuum Ca II K) was "
+            "expected; the wavelength axis looks like the wrong grid or the wrong frame."
+            % (wave_1d[k_core], lambda0_vac))
 
     # Interpolate S onto the synthesis wavelength grid (identity when grids match):
     if chi.shape[1] == len(wave) and np.allclose(wave_1d, wave):
@@ -138,8 +175,7 @@ def calc_op_em(param_ray, wavelengths, refine =0, s1d=None, dz_cal=0.0):
         if h_los is not None:
             h_los = interp1d(np.arange(len(h_los)), h_los, kind='cubic')(np.linspace(0,len(h_los)-1,len(h_los)*refine))
 
-    op = np.zeros((len(wavelengths), len(T_los)))
-    em = np.zeros((len(wavelengths), len(T_los)))
+    # op and em are assigned in full below; no need to pre-allocate.
     
     # Just to check:    
     '''
@@ -188,48 +224,46 @@ def calc_op_em(param_ray, wavelengths, refine =0, s1d=None, dz_cal=0.0):
     # Calculate profiles without the loop:
     phi = fvoigt(a[None,:], vv)
 
-    # Finally calculate op and em, without the loop:
+    # Line opacity, total, no loop (line + continuum; op needs continuum in both paths):
     op = (const.h.cgs.value * nu0 / (4 * np.pi)) * (pops_l_los[None,:] * B_lu - pops_u_los[None,:] * B_ul) * phi / dnu_D
-    #em = op * planck(393.36E-7, T_los)[None,:]
-    
-    em = (const.h.cgs.value * nu0 / (4 * np.pi)) * pops_u_los[None,:] * A_ul * phi / dnu_D
-
-    # Introducing an ad-hoc calculation of the source function to get realistic spectral line.
-    #Stemp = pops[4] * A_ul / pops[0] / B_lu
-    #print (Stemp[::20])
-    
     opc = continuum_opacity(wavelengths[0,None], T_los, ne_los*1E6, nH_los*1E6)/1E2 # in cm^-1
-    emc = opc * planck(wavelengths[0]*1E-7, T_los)
-    
     op += opc[None,:]
-    em += emc[None,:]
 
-    # Override the emissivity with the 1D PRD source function S(lambda, z), if provided.
-    # Single total source function applied to the total opacity (no line/continuum split):
-    #   eta = chi * S(lambda', z'),  with lambda' velocity-shifted and z' calibration-shifted.
     if s1d is not None and h_los is not None and len(h_los) > 0:
-        from scipy.interpolate import RegularGridInterpolator as rgi
-        # Rest-frame (co-moving) wavelength at each sample point [nm]; same shift as the profile:
+        # Emissivity from the 1D PRD source function: eta = chi * S(lambda', z'),
+        # lambda' velocity-shifted (rest frame), z' calibration-shifted. Separable
+        # linear interpolation of the (z, lambda) table -- identical result to a 2D
+        # RegularGridInterpolator, but without the scattered-point cell search.
         dlam_nm = (v_los / const.c.cgs.value) * llambda0 * 1e7        # cm -> nm
-        lam_q = wavelengths[:, None] - dlam_nm[None, :]              # [Nlam, Ns]
+        lam_q = wavelengths[:, None] - dlam_nm[None, :]              # [Nl, Ns]
         h_q = h_los - dz_cal                                        # [Ns], km
-
-        # Clamp to the table range: nearest-edge above the FALC top / beyond the grid edges.
+        # Clamp to the table range (nearest-edge above the FALC top / beyond the edges):
         lam_q = np.clip(lam_q, s1d['wave'][0], s1d['wave'][-1])
         h_qc = np.clip(h_q, s1d['z'][0], s1d['z'][-1])
-        # The table is S(z, lambda), so interpolate on the (z, lambda) grid:
-        S_interp = rgi((s1d['z'], s1d['wave']), s1d['S'], bounds_error=False, fill_value=None)
-        Nl = wavelengths.shape[0]
-        Ns = h_los.shape[0]
-        h_grid = np.broadcast_to(h_qc[None, :], (Nl, Ns))           # [Nlam, Ns]
-        pts = np.empty((Nl * Ns, 2))
-        pts[:, 0] = h_grid.ravel()      # z
-        pts[:, 1] = lam_q.ravel()       # lambda
-        S_ray = S_interp(pts).reshape(Nl, Ns)
-        em = op * S_ray
 
-    #op[T_los<1.0] = 1E-20
-    #em[T_los<1.0] = 0.0
+        zt = s1d['z']        # ascending heights [Nz1d]
+        lw = s1d['wave']     # ascending, uniform wavelength grid [Nlam1d]
+        Stab = s1d['S']      # [Nz1d, Nlam1d]
+
+        # (a) linear interpolation in height -> S_z [Ns, Nlam1d]
+        iz = np.clip(np.searchsorted(zt, h_qc) - 1, 0, len(zt) - 2)
+        wz = np.clip((h_qc - zt[iz]) / (zt[iz + 1] - zt[iz]), 0.0, 1.0)
+        S_z = (1.0 - wz)[:, None] * Stab[iz, :] + wz[:, None] * Stab[iz + 1, :]
+
+        # (b) linear interpolation in wavelength (uniform grid) -> S_ray [Nl, Ns]
+        dl = lw[1] - lw[0]
+        fl = (lam_q - lw[0]) / dl
+        il0 = np.clip(np.floor(fl).astype(np.intp), 0, len(lw) - 2)
+        wl = np.clip(fl - il0, 0.0, 1.0)
+        s_idx = np.arange(h_qc.shape[0])[None, :]                   # [1, Ns]
+        S_ray = (1.0 - wl) * S_z[s_idx, il0] + wl * S_z[s_idx, il0 + 1]
+
+        em = op * S_ray
+    else:
+        # Legacy emissivity: spontaneous line term + continuum emissivity.
+        em = (const.h.cgs.value * nu0 / (4 * np.pi)) * pops_u_los[None,:] * A_ul * phi / dnu_D
+        emc = opc * planck(wavelengths[0]*1E-7, T_los)
+        em += emc[None,:]
 
     return op, em
 

@@ -28,16 +28,15 @@ import h5py
 # And finally physics stuff:
 import calc_op_em as coe
 
-# Interpolation:
-from scipy.interpolate import RegularGridInterpolator as rgi
+# Interpolation: create_ray now uses precomputed bilinear weights (see _ray_weights),
+# so RegularGridInterpolator is no longer needed here.
 
 # -----------------------------------------------------------------------------------------------------------------------------------
 
 def airtovac(lambda_air):
-
-    s = 1E4/(lambda_air*1E1);
-    n = 1.0 + 0.00008336624212083 + 0.02408926869968 / (130.1065924522 - s*s) + 0.0001599740894897 / (38.92568793293 - s*s);
-    return lambda_air * n
+    # Backward-compatible shim. The canonical air<->vacuum conversion now lives in
+    # calc_op_em (coe.air_to_vac / coe.vac_to_air) so it is defined in exactly one place.
+    return coe.air_to_vac(lambda_air)
 
 def synth(param_ray, wavelengths, ds, boundary=0, s1d=None, dz_cal=0.0, use_source_function=False):
 
@@ -74,47 +73,62 @@ def create_curved_grid(z_index, delta_s=24.0, delta_z=20.0, R_sun=696.0E3):
 
     return s, y, z
 
+# Precomputed bilinear weights mapping the (NY, NZ) slit plane onto ray z_index's
+# curved-ray points. The geometry depends only on z_index (and the fixed plane grid),
+# so the weights are identical across all slits -- compute once per z_index and cache.
+_RAY_W_CACHE = {}
+
+def _ray_weights(z_index, NY, NZ, delta_los=24.0, delta_z=20.0):
+    key = (z_index, NY, NZ)
+    cached = _RAY_W_CACHE.get(key)
+    if cached is not None:
+        return cached
+    s, y, z = create_curved_grid(z_index)
+    # Fractional grid indices of the ray points on the plane grids:
+    #   y_slice = (arange(NY) - NY//2) * delta_los  ->  fy = y/delta_los + NY//2
+    #   z_slice =  arange(NZ)          * delta_z    ->  fz = z/delta_z
+    fy = y / delta_los + (NY // 2)
+    fz = z / delta_z
+    # In-box test (reproduces rgi bounds_error=False, fill_value=0.0):
+    valid = (fy >= 0) & (fy <= NY - 1) & (fz >= 0) & (fz <= NZ - 1)
+    iy0 = np.clip(np.floor(fy).astype(np.intp), 0, NY - 2)
+    iz0 = np.clip(np.floor(fz).astype(np.intp), 0, NZ - 2)
+    wy = fy - iy0
+    wz = fz - iz0
+    # Flat indices into a C-order (NY, NZ) plane:
+    i00 = (iy0 * NZ + iz0).astype(np.int32)
+    i01 = (iy0 * NZ + (iz0 + 1)).astype(np.int32)
+    i10 = ((iy0 + 1) * NZ + iz0).astype(np.int32)
+    i11 = ((iy0 + 1) * NZ + (iz0 + 1)).astype(np.int32)
+    # Corner weights, zeroed outside the box so out-of-grid points evaluate to 0:
+    w00 = np.where(valid, (1.0 - wy) * (1.0 - wz), 0.0)
+    w01 = np.where(valid, (1.0 - wy) * wz, 0.0)
+    w10 = np.where(valid, wy * (1.0 - wz), 0.0)
+    w11 = np.where(valid, wy * wz, 0.0)
+    out = (i00, i01, i10, i11, w00, w01, w10, w11, z)
+    _RAY_W_CACHE[key] = out
+    return out
+
 def create_ray(slice, z_index):
-    
-    param_ray = 0
-    
-    # We need to create a grid of y, z values that traverses as it travels in the spherical geometry 
-    # Then we bi-linearly interpolate where we can, and where we fall out - we just set zeros (or we don't even need anything)
-    
-    s,y,z = create_curved_grid(z_index)
-    
+
+    # Bilinearly interpolate the (NY, NZ) slit plane onto the curved ray, using
+    # precomputed weights -- same result as the old per-quantity RegularGridInterpolator
+    # calls, but built once per z_index and reused across every slit.
     NY = slice['Temperature'].shape[0]
     NZ = slice['Temperature'].shape[1]
-    
-    delta_los = 24.0
-    delta_z = 20.0
-    
-    # Then we just interpolate the slice to get the parameters at each point.
-    y_slice = (np.arange(NY) - NY // 2) * delta_los
-    z_slice = (np.arange(NZ)) * delta_z
-    
-    # Let's use scipy's regular grid interpolator for this
-    
-    interpolator = rgi((y_slice, z_slice), slice['Temperature'], bounds_error=False, fill_value=0.0)
-    T_interpolated = interpolator((y, z))
-    interpolator = rgi((y_slice, z_slice), slice['Pressure'], bounds_error=False, fill_value=0.0)
-    P_interpolated = interpolator((y, z))
-    interpolator = rgi((y_slice, z_slice), slice['Electron_density'], bounds_error=False, fill_value=0.0)
-    Ne_interpolated = interpolator((y, z))
-    interpolator = rgi((y_slice, z_slice), slice['LOS_velocity'], bounds_error=False, fill_value=0.0)
-    V_interpolated = interpolator((y, z))
-    interpolator = rgi((y_slice, z_slice), slice['Population_lower_level'], bounds_error=False, fill_value=0.0)
-    PopL_interpolated = interpolator((y, z))
-    interpolator = rgi((y_slice, z_slice), slice['Population_upper_level'], bounds_error=False, fill_value=0.0)
-    PopU_interpolated = interpolator((y, z))
-    
+    i00, i01, i10, i11, w00, w01, w10, w11, z = _ray_weights(z_index, NY, NZ)
+
+    def gather(Q):
+        f = np.asarray(Q).reshape(-1)
+        return f[i00] * w00 + f[i01] * w01 + f[i10] * w10 + f[i11] * w11
+
     param_ray = {
-        'Temperature': T_interpolated,
-        'Pressure': P_interpolated,
-        'Electron_density': Ne_interpolated,
-        'LOS_velocity': V_interpolated,
-        'Population_lower_level': PopL_interpolated/1E6, # We will choose to convert to cgs here
-        'Population_upper_level': PopU_interpolated/1E6,
+        'Temperature': gather(slice['Temperature']),
+        'Pressure': gather(slice['Pressure']),
+        'Electron_density': gather(slice['Electron_density']),
+        'LOS_velocity': gather(slice['LOS_velocity']),
+        'Population_lower_level': gather(slice['Population_lower_level']) / 1E6, # to cgs
+        'Population_upper_level': gather(slice['Population_upper_level']) / 1E6,
         'Height': z # geometric height above the surface along the curved ray [km], for S(lambda,z)
     }
 

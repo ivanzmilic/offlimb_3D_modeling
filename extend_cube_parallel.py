@@ -39,7 +39,7 @@ import multiprocessing as mp
 # Output dtype. MURaM data is float32 natively, so float32 halves RAM, disk, and memory
 # bandwidth with no meaningful precision loss. Set to np.float64 for bit-identical output
 # to the original script.
-OUT_DTYPE = np.float32
+OUT_DTYPE = np.float64
 
 # Geometry / grid (hardcoded, matching extend_cube.py; TODOs carried over):
 ANGLE_DEG = 80          # TODO: hardcoded
